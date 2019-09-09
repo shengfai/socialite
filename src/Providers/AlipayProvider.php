@@ -12,6 +12,8 @@ namespace Overtrue\Socialite\Providers;
 use Overtrue\Socialite\AccessTokenInterface;
 use Overtrue\Socialite\ProviderInterface;
 use Overtrue\Socialite\User;
+use Illuminate\Support\Str;
+use Overtrue\Socialite\InvalidStateException;
 
 /**
  *
@@ -132,7 +134,7 @@ class AlipayProvider extends AbstractProvider implements ProviderInterface
             'grant_type' => $this->formatScopes($this->scopes, $this->scopeSeparator)
         ];
         
-        return $this->getPublicFields($token, $parameters);
+        return $this->getPublicFields($parameters);
     }
 
     /**
@@ -142,11 +144,11 @@ class AlipayProvider extends AbstractProvider implements ProviderInterface
     protected function getUserInfoFields(AccessTokenInterface $token)
     {
         $parameters = [
-            'method' => 'alipay.system.oauth.token',
+            'method' => 'alipay.user.info.share',
             'auth_token' => $token->getToken()
         ];
         
-        return $this->getPublicFields($token, $parameters);
+        return $this->getPublicFields($parameters);
     }
 
     /**
@@ -158,9 +160,19 @@ class AlipayProvider extends AbstractProvider implements ProviderInterface
      */
     public function getAccessToken($code)
     {
-        $response = $this->getHttpClient()->get($this->getTokenUrl(), $this->getTokenFields($code));
+        try {
+            
+            $response = $this->getHttpClient()->get($this->getTokenUrl(), [
+                'query' => $this->getTokenFields($code)
+            ]);
+            
+            $result = json_decode($response->getBody()->getContents(), true);
+            
+            return $this->parseAccessToken($result['alipay_system_oauth_token_response']);
         
-        return $this->parseAccessToken($response->getBody()->getContents());
+        } catch (\Exception $e) {
+            throw new InvalidStateException($result['error_response']['sub_msg'], $result['error_response']['code']);
+        }
     }
 
     /**
@@ -172,9 +184,19 @@ class AlipayProvider extends AbstractProvider implements ProviderInterface
      */
     protected function getUserByToken(AccessTokenInterface $token)
     {
-        $response = $this->getHttpClient()->get($this->getUserInfoUrl(), $this->getUserInfoFields($token));
+        try {
+            
+            $response = $this->getHttpClient()->get($this->getUserInfoUrl(), [
+                'query' => $this->getUserInfoFields($token)
+            ]);
+            
+            $result = json_decode($response->getBody()->getContents(), true);
+            
+            return $result['alipay_user_info_share_response'];
         
-        return $this->parseAccessToken($response->getBody()->getContents());
+        } catch (\Exception $e) {
+            throw new InvalidStateException($result['error_response']['sub_msg'], $result['error_response']['code']);
+        }
     }
 
     /**
@@ -187,7 +209,7 @@ class AlipayProvider extends AbstractProvider implements ProviderInterface
     protected function mapUserToObject(array $user)
     {
         return new User([
-            'id' => $this->arrayItem($user, 'user_id'),
+            'user_id' => $this->arrayItem($user, 'user_id'),
             'nickname' => $this->arrayItem($user, 'nick_name'),
             'name' => $this->arrayItem($user, 'nick_name'),
             'avatar' => $this->arrayItem($user, 'avatar'),
@@ -201,26 +223,52 @@ class AlipayProvider extends AbstractProvider implements ProviderInterface
     }
 
     /**
+     * Generate the sign for given params.
      *
-     * @param
-     *        $params
-     *
+     * @param array $params
      * @return string
      */
-    protected function generateSign($params)
+    protected function generateSign(array $params)
     {
-        ksort($params);
+        if (Str::endsWith($this->clientSecret, '.pem')) {
+            $privateKey = openssl_pkey_get_private($this->clientSecret);
+        } else {
+            $privateKey = "-----BEGIN RSA PRIVATE KEY-----\n" . wordwrap($this->clientSecret, 64, "\n", true) . "\n-----END RSA PRIVATE KEY-----";
+        }
         
-        $stringToBeSigned = $this->clientSecret;
+        $payload = $this->getSignContent($params);
         
-        foreach ($params as $k => $v) {
-            if (!is_array($v) && '@' != substr($v, 0, 1)) {
-                $stringToBeSigned .= "$k$v";
+        openssl_sign($payload, $sign, $privateKey, OPENSSL_ALGO_SHA256);
+        
+        $sign = base64_encode($sign);
+        
+        if (is_resource($privateKey)) {
+            openssl_free_key($privateKey);
+        }
+        
+        return $sign;
+    }
+
+    /**
+     * Get the sign content for the given data.
+     *
+     * @param array $data
+     * @param string $verify
+     */
+    protected function getSignContent(array $data, $verify = false): string
+    {
+        ksort($data);
+        
+        $stringToBeSigned = '';
+        foreach ($data as $k => $v) {
+            if ($verify && $k != 'sign' && $k != 'sign_type') {
+                $stringToBeSigned .= $k . '=' . $v . '&';
+            }
+            if (!$verify && $v !== '' && !is_null($v) && $k != 'sign' && '@' != substr($v, 0, 1)) {
+                $stringToBeSigned .= $k . '=' . $v . '&';
             }
         }
         
-        $stringToBeSigned .= $this->clientSecret;
-        
-        return strtoupper(md5($stringToBeSigned));
+        return trim($stringToBeSigned, '&');
     }
 }
